@@ -12,6 +12,7 @@ It only READS prices. It does not buy, sell, or trade anything.
 """
 import csv
 import json
+import math
 import os
 import random
 import shlex
@@ -36,7 +37,13 @@ CACHE_PATH = os.path.join(APP_DIR, "buff_cache.json")
 
 DEFAULT_CONFIG = {
     # PLACEHOLDERS - set these to the current real rates before trusting results
-    "usd_per_coin": 0.61,          # what 1 CSGORoll coin is worth in USD
+    "usd_per_coin": 0.7011478,     # what 1 CSGORoll coin is worth in USD
+    "budget_coins": 220.0,         # coins you want to spend
+    "max_skins": 5,                # most skins the best basket may contain
+    "min_spend_pct": 95.0,         # basket must use at least this % of the budget
+    "auto_cny_rate": True,         # fetch the live CNY per USD rate each run
+    "pre_scroll_pause": 15,        # seconds you get to set the site's own filters before scrolling
+    "config_version": 2,
     "cny_per_usd": 7.2,            # CNY -> USD conversion for Buff prices
     "skinscom_factor": 0.95,       # skins.com instant sell = Buff price x this
     "buff_price_mode": "sell_min", # "sell_min" = lowest listing, "buy_max" = highest buy order
@@ -73,7 +80,12 @@ def load_config():
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg.update(json.load(f))
+                saved = json.load(f)
+            if saved.get("config_version", 1) < DEFAULT_CONFIG["config_version"]:
+                for k in ("usd_per_coin", "min_coins", "max_coins", "max_pages", "min_roi_pct"):
+                    saved.pop(k, None)
+                saved["config_version"] = DEFAULT_CONFIG["config_version"]
+            cfg.update(saved)
         except Exception:
             pass
     else:
@@ -242,6 +254,11 @@ def fetch_csgoroll_browser(ctx, cfg, log, stop):
             "Captured no listings. Make sure items show on the market page in the window, "
             "or adjust name_keys / price_keys in config.json."
         )
+    pause = float(cfg.get("pre_scroll_pause", 0))
+    if pause > 0:
+        log(f"First batch: {len(items)} listings. TIP: set the site's own price filter / sort in the window now. "
+            f"Scrolling starts in {pause:.0f}s.")
+        page.wait_for_timeout(int(pause * 1000))
     log(f"First batch: {len(items)} listings. Scrolling for more...")
 
     lo = float(cfg["min_coins"])
@@ -426,12 +443,14 @@ def compute_row(listing, buff, cfg):
     return {
         "name": listing["name"], "coins": listing["coins"], "cost_usd": cost,
         "buff_cny": buff_cny, "buff_usd": buff_usd, "payout_usd": payout,
-        "profit_usd": profit, "roi_pct": roi, "buff_listings": buff["sell_num"],
+        "profit_usd": profit, "roi_pct": roi, "keep_pct": roi + 100.0, "buff_listings": buff["sell_num"],
     }
 
 
 def run_compare(listings, cfg, log, stop=lambda: False, lookup=buff_lookup, sleep=True, session=None):
     lo, hi = float(cfg["min_coins"]), float(cfg["max_coins"])
+    if float(cfg.get("budget_coins", 0)) > 0:
+        hi = min(hi, float(cfg["budget_coins"]))  # nothing above your budget can be bought
     filtered = [x for x in listings if lo <= x["coins"] <= hi]
     log(f"Coin filter {lo:g}-{hi:g}: {len(filtered)} of {len(listings)} listings kept")
 
@@ -471,7 +490,7 @@ def run_compare(listings, cfg, log, stop=lambda: False, lookup=buff_lookup, slee
             no_match.append(x)
             continue
         rows.append(compute_row(x, b, cfg))
-    rows.sort(key=lambda r: r["profit_usd"], reverse=True)
+    rows.sort(key=lambda r: r["keep_pct"], reverse=True)
     not_looked = len(filtered) - len(rows) - len(no_match)
     log(f"Summary: {len(filtered)} in coin range, {len(rows)} priced on Buff, "
         f"{len(no_match)} not found on Buff"
@@ -481,12 +500,90 @@ def run_compare(listings, cfg, log, stop=lambda: False, lookup=buff_lookup, slee
     for x in sorted(no_match, key=lambda x: x["coins"]):
         rows.append({"name": x["name"], "coins": x["coins"], "cost_usd": x["coins"] * cfg["usd_per_coin"],
                      "buff_cny": None, "buff_usd": None, "payout_usd": None,
-                     "profit_usd": None, "roi_pct": None, "buff_listings": None})
+                     "profit_usd": None, "roi_pct": None, "keep_pct": None, "buff_listings": None})
     return rows
 
 
 # ------------------------------------------------------------------ GUI -----
+def best_basket(rows, budget, max_skins, usd_per_coin, min_spend_pct=95.0, unit=0.1):
+    """Choose skins totalling <= budget coins that lose the least cash.
+
+    Exact 0/1 knapsack over (number of skins, coins spent). Among baskets that spend at least
+    min_spend_pct of the budget, pick the one with the smallest loss (cost - sale value).
+    """
+    cand = [r for r in rows if r.get("payout_usd") is not None and 0 < r["coins"] <= budget]
+    cand.sort(key=lambda r: r["keep_pct"], reverse=True)
+    cand = cand[:200]
+    if not cand or budget <= 0:
+        return []
+    C = int(budget / unit + 1e-9)
+    K = max(1, min(int(max_skins), len(cand)))
+    w = [min(C + 1, int(math.ceil(r["coins"] / unit - 1e-9))) for r in cand]
+    dp = [[-1.0] * (C + 1) for _ in range(K + 1)]
+    dp[0][0] = 0.0
+    choice = []
+    for i, r in enumerate(cand):
+        wi, vi = w[i], r["payout_usd"]
+        flags = [bytearray(C + 1) for _ in range(K + 1)]
+        for k in range(min(K, i + 1), 0, -1):
+            prev, cur, fl = dp[k - 1], dp[k], flags[k]
+            for c in range(C, wi - 1, -1):
+                p = prev[c - wi]
+                if p >= 0 and p + vi > cur[c]:
+                    cur[c] = p + vi
+                    fl[c] = 1
+        choice.append(flags)
+
+    def pick(lo_c):
+        best = (None, 0, 0)
+        for k in range(1, K + 1):
+            for c in range(lo_c, C + 1):
+                v = dp[k][c]
+                if v >= 0:
+                    score = v - c * unit * usd_per_coin
+                    if best[0] is None or score > best[0]:
+                        best = (score, k, c)
+        return best
+
+    score, k, c = pick(int(C * float(min_spend_pct) / 100.0))
+    if score is None:
+        score, k, c = pick(1)
+    if score is None:
+        return []
+    picked = []
+    for i in range(len(cand) - 1, -1, -1):
+        if k > 0 and choice[i][k][c]:
+            picked.append(cand[i])
+            k -= 1
+            c -= w[i]
+    return picked
+
+
+def basket_summary(basket):
+    coins = sum(r["coins"] for r in basket)
+    cost = sum(r["cost_usd"] for r in basket)
+    pay = sum(r["payout_usd"] for r in basket)
+    return coins, cost, pay, cost - pay, (pay / cost * 100 if cost else 0.0)
+
+
+def get_cny_rate(log):
+    try:
+        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
+        rate = float(r.json()["rates"]["CNY"])
+        if 5 < rate < 10:
+            log(f"Live rate: {rate:.4f} CNY per USD")
+            return rate
+    except Exception:
+        pass
+    log("Could not fetch the live CNY rate; using the number in the app.")
+    return None
+
+
 def do_fetch_and_compare(cfg, log, stop):
+    if cfg.get("auto_cny_rate", True):
+        rate = get_cny_rate(log)
+        if rate:
+            cfg["cny_per_usd"] = rate
     if not cfg.get("use_browser", True):
         listings = fetch_csgoroll(cfg, log)
         log(f"Pulled {len(listings)} listings from CSGORoll.")
@@ -515,7 +612,7 @@ COLUMNS = [
     ("name", "Item", 280), ("coins", "Coins", 70), ("cost_usd", "Cost $", 70),
     ("buff_cny", "Buff ¥", 70), ("buff_usd", "Buff $", 70),
     ("payout_usd", "skins.com $", 85), ("profit_usd", "Profit $", 75),
-    ("roi_pct", "ROI %", 65), ("buff_listings", "Buff #", 55),
+    ("keep_pct", "Keep %", 65), ("buff_listings", "Buff #", 55),
 ]
 
 
@@ -526,16 +623,16 @@ def main_gui():
     cfg = load_config()
     root = tk.Tk()
     root.title("CSGORoll → Buff → skins.com")
-    root.geometry("1000x620")
+    root.geometry("1000x760")
 
     top = ttk.Frame(root, padding=8)
     top.pack(fill="x")
     vars_ = {}
 
-    def field(label, key, col, width=8):
-        ttk.Label(top, text=label).grid(row=0, column=col * 2, sticky="e", padx=(8, 2))
+    def field(label, key, col, width=8, row=0):
+        ttk.Label(top, text=label).grid(row=row, column=col * 2, sticky="e", padx=(8, 2))
         v = tk.StringVar(value=str(cfg[key]))
-        ttk.Entry(top, textvariable=v, width=width).grid(row=0, column=col * 2 + 1)
+        ttk.Entry(top, textvariable=v, width=width).grid(row=row, column=col * 2 + 1)
         vars_[key] = v
 
     field("Min coins", "min_coins", 0)
@@ -547,7 +644,11 @@ def main_gui():
     mode = tk.StringVar(value="Lowest listing" if cfg["buff_price_mode"] == "sell_min" else "Highest buy order")
     ttk.Combobox(top, textvariable=mode, state="readonly", width=18,
                  values=["Lowest listing", "Highest buy order"]).grid(row=1, column=1, columnspan=2, sticky="w")
+    field("Budget coins", "budget_coins", 2, 8, 1)
+    field("Max skins", "max_skins", 3, 5, 1)
 
+    basketbox = tk.Text(root, height=8, state="disabled")
+    basketbox.pack(fill="x", padx=8, pady=(0, 6))
     tree = ttk.Treeview(root, columns=[c[0] for c in COLUMNS], show="headings")
     for key, title, w in COLUMNS:
         tree.heading(key, text=title, command=lambda k=key: sort_by(k))
@@ -574,7 +675,7 @@ def main_gui():
         for r in rows:
             tree.insert("", "end", values=(
                 r["name"], f(r["coins"]), f(r["cost_usd"]), f(r["buff_cny"]), f(r["buff_usd"]),
-                f(r["payout_usd"]), f(r["profit_usd"]), f(r["roi_pct"], 1),
+                f(r["payout_usd"]), f(r["profit_usd"]), f(r["keep_pct"], 1),
                 "-" if r["buff_listings"] is None else r["buff_listings"]))
 
     def sort_by(key):
@@ -591,6 +692,7 @@ def main_gui():
             rows = do_fetch_and_compare(cfg, log, lambda: state["stop"])
             state["rows"] = rows
             root.after(0, lambda: show(rows))
+            root.after(0, show_basket)
         except Exception as e:
             log(f"ERROR: {e}")
         finally:
@@ -612,6 +714,30 @@ def main_gui():
         fetch_btn.configure(state="disabled")
         threading.Thread(target=worker, daemon=True).start()
 
+    def show_basket():
+        try:
+            for k in ("budget_coins", "max_skins"):
+                cfg[k] = float(vars_[k].get())
+        except ValueError:
+            return
+        basket = best_basket(state["rows"], cfg["budget_coins"], cfg["max_skins"],
+                             cfg["usd_per_coin"], cfg["min_spend_pct"])
+        if not basket:
+            text = "No basket found: no priced listing fits your budget."
+        else:
+            lines = ["BEST BASKET (least cash lost)"]
+            for r in sorted(basket, key=lambda r: -r["coins"]):
+                lines.append(f"  {r['coins']:.2f} coins  ${r['cost_usd']:.2f} -> sells ${r['payout_usd']:.2f}"
+                             f"  keep {r['keep_pct']:.1f}%   {r['name']}")
+            coins, cost, pay, loss, keep = basket_summary(basket)
+            lines.append(f"TOTAL: {len(basket)} skin(s), {coins:.2f} of {cfg['budget_coins']:g} coins | "
+                         f"cost ${cost:.2f} | sells ${pay:.2f} | loss ${loss:.2f} ({keep:.1f}% kept)")
+            text = "\n".join(lines)
+        basketbox.configure(state="normal")
+        basketbox.delete("1.0", "end")
+        basketbox.insert("end", text)
+        basketbox.configure(state="disabled")
+
     def on_export():
         if not state["rows"]:
             return
@@ -628,6 +754,7 @@ def main_gui():
     fetch_btn.pack(side="left")
     ttk.Button(btns, text="Stop", command=lambda: state.update(stop=True)).pack(side="left", padx=6)
     ttk.Button(btns, text="Export CSV", command=on_export).pack(side="left")
+    ttk.Button(btns, text="Best basket", command=show_basket).pack(side="left", padx=6)
 
     root.mainloop()
 

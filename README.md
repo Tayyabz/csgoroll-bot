@@ -11,20 +11,26 @@ It builds automatically on GitHub: **Actions** tab → latest "Build Windows exe
 ## Use it
 1. You need **Google Chrome** (or Microsoft Edge) installed.
 2. Double-click `CSGORollArb.exe`. A window opens (no black console).
-3. Set **Min coins / Max coins** (the coin filter) and the two rates (see below).
+3. Set **Budget coins** (the coins you have) and **Max skins** (the most skins you're willing to buy).
+   Min/Max coins is an optional extra filter; Max is automatically capped at your budget.
 4. Press **Fetch & Compare**. A browser window opens on the CSGORoll market.
    - **First time only:** log in to CSGORoll in that window. If Buff163 asks, log in there too.
      The logins are saved in the `browser_profile` folder next to the exe, so later runs need nothing.
    - Leave the window alone while it scrolls. It closes by itself when done.
-5. Results are sorted by profit. Click any column header to re-sort. Items not found on Buff are listed at the bottom with "-". **Export CSV** saves them.
+5. The **Best basket** box at the top shows the skins (one or several, within your budget) that lose the least cash when sold.
+   The table lists every listing sorted by **Keep %** (how much of what you paid comes back). Click any header to re-sort.
+   Items not found on Buff are at the bottom with "-". Change Budget/Max skins and press **Best basket** to recompute without re-fetching. **Export CSV** saves the table.
 
 Tip: if the site's list is sorted high to low (default), the app stops scrolling once it reaches
 listings below your Min coins, so a narrow range with a high minimum is fast.
 
+Tip 2: after the first listings load you get 15 seconds to use the site's own sort / price filter in the window
+(for example price up to your budget). Then the app scrolls and collects whatever the site shows.
+
 ## Set your rates (important)
 The defaults are placeholders. Check them in the app (top bar) or `config.json`:
-- `usd_per_coin`: what 1 CSGORoll coin is worth in USD
-- `cny_per_usd`: current CNY per 1 USD
+- `usd_per_coin`: what 1 CSGORoll coin is worth in USD (default 0.7011478)
+- `cny_per_usd`: CNY per 1 USD. It is fetched live each run; the number in the app is only a fallback.
 - `skinscom_factor`: 0.95 (your "Buff minus 5%")
 - `buff_price_mode`: lowest listing or highest buy order (dropdown in the app)
 
