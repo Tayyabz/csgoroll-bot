@@ -14,9 +14,9 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: python -m pip install --upgrade requests pyinstaller
+        run: python -m pip install --upgrade requests playwright pyinstaller
       - name: Build exe (windowed GUI app, no console)
-        run: python -m PyInstaller --onefile --windowed --name CSGORollArb arb_bot.py
+        run: python -m PyInstaller --onefile --windowed --name CSGORollArb --collect-all playwright arb_bot.py
       - name: Upload exe
         uses: actions/upload-artifact@v4
         with:

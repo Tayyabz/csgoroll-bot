@@ -21,6 +21,12 @@ import time
 
 import requests
 
+# windowed (no console) builds have no stdout/stderr; give libraries something to write to
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 APP_DIR = os.path.dirname(
     os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)
 )
@@ -36,7 +42,15 @@ DEFAULT_CONFIG = {
     "buff_price_mode": "sell_min", # "sell_min" = lowest listing, "buy_max" = highest buy order
     "buff_cookie": "",             # paste your buff.163.com cookie, e.g. session=xxxx
     "min_buff_listings": 3,        # ignore Buff prices backed by fewer listings (fake lows)
-    "max_pages": 20,               # max CSGORoll pages to pull per fetch
+    "max_pages": 30,               # max scroll rounds (browser mode) / pages (cURL mode)
+    "use_browser": True,           # True = built-in Chrome/Edge window (log in once). False = cURL file mode
+    "browser_channel": "chrome",   # "chrome" or "msedge"; the other one is tried automatically
+    "browser_executable": "",      # optional full path to a Chromium-based browser exe
+    "browser_headless": False,     # leave False: you need to see the window to log in
+    "market_url": "https://www.csgoroll.com/trade/market/",
+    "buff_url": "https://buff.163.com/market/csgo",
+    "login_wait_seconds": 180,     # how long to wait for you to log in inside the window
+    "scroll_wait": 1.5,            # seconds to wait after each scroll for new listings
     "cache_minutes": 30,           # reuse Buff prices this long to avoid hammering Buff
     "min_coins": 0.0,
     "max_coins": 100000.0,
@@ -149,6 +163,162 @@ def find_page_info(node):
     return None
 
 
+def launch_context(pw, cfg, log):
+    """Open Chrome/Edge with a saved profile so you only log in once."""
+    base = dict(
+        user_data_dir=os.path.join(APP_DIR, "browser_profile"),
+        headless=bool(cfg.get("browser_headless", False)),
+        viewport={"width": 1280, "height": 900},
+        args=["--disable-blink-features=AutomationControlled"],
+        ignore_default_args=["--enable-automation"],
+    )
+    exe = (cfg.get("browser_executable") or "").strip()
+    if exe:
+        return pw.chromium.launch_persistent_context(executable_path=exe, **base)
+    first = cfg.get("browser_channel") or "chrome"
+    last = None
+    for ch in [first] + [c for c in ("chrome", "msedge") if c != first]:
+        try:
+            log(f"Opening {ch} window...")
+            return pw.chromium.launch_persistent_context(channel=ch, **base)
+        except Exception as e:
+            last = e
+    raise RuntimeError(
+        "Could not open Chrome or Edge. Install Google Chrome, or set browser_executable "
+        "in config.json. (" + str(last).splitlines()[0] + ")"
+    )
+
+
+SCROLL_JS = """() => {
+  window.scrollTo(0, document.body.scrollHeight);
+  document.querySelectorAll('*').forEach(e => {
+    if (e.scrollHeight > e.clientHeight + 50 && /auto|scroll/.test(getComputedStyle(e).overflowY)) {
+      e.scrollTop = e.scrollHeight;
+    }
+  });
+}"""
+
+
+def _is_desc(items):
+    return all(items[i]["coins"] >= items[i + 1]["coins"] for i in range(len(items) - 1))
+
+
+def fetch_csgoroll_browser(ctx, cfg, log, stop):
+    """Open the market page, record every graphql response, keep scrolling for more."""
+    items, seen = [], set()
+
+    def on_response(resp):
+        try:
+            if "graphql" not in resp.url or resp.request.resource_type not in ("fetch", "xhr"):
+                return
+            data = resp.json()
+        except Exception:
+            return
+        for it in extract_items(data, cfg["name_keys"], cfg["price_keys"]):
+            key = it["id"] or (it["name"], it["coins"])
+            if key not in seen:
+                seen.add(key)
+                items.append(it)
+
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    page.on("response", on_response)
+    log("Loading the CSGORoll market (log in in the window if it asks)...")
+    try:
+        page.goto(cfg["market_url"], wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        log("Page load was slow: " + str(e).splitlines()[0])
+
+    t0, warned = time.time(), False
+    while not items and time.time() - t0 < float(cfg["login_wait_seconds"]):
+        if stop():
+            return items
+        if not warned and time.time() - t0 > 20:
+            log("No listings captured yet. Log in / pass any check in the window; I'll keep waiting.")
+            warned = True
+        page.wait_for_timeout(1000)
+    if not items:
+        raise RuntimeError(
+            "Captured no listings. Make sure items show on the market page in the window, "
+            "or adjust name_keys / price_keys in config.json."
+        )
+    log(f"First batch: {len(items)} listings. Scrolling for more...")
+
+    lo = float(cfg["min_coins"])
+    idle = 0
+    for rnd in range(int(cfg["max_pages"])):
+        if stop():
+            break
+        before = len(items)
+        try:
+            page.evaluate(SCROLL_JS)
+            page.mouse.move(640, 450)
+            page.mouse.wheel(0, 3000)
+        except Exception:
+            pass
+        page.wait_for_timeout(int(float(cfg["scroll_wait"]) * 1000))
+        added = len(items) - before
+        log(f"Scroll {rnd + 1}: {len(items)} listings captured")
+        idle = idle + 1 if added == 0 else 0
+        if idle >= 4:
+            log("No more listings are loading.")
+            break
+        if lo > 0 and len(items) > 5 and _is_desc(items) and items[-1]["coins"] < lo:
+            log("Reached listings below your Min coins (list is sorted high to low): stopping early.")
+            break
+    return items
+
+
+class _Resp:
+    def __init__(self, r):
+        self.status_code = r.status
+        self._r = r
+
+    def json(self):
+        return self._r.json()
+
+
+class BrowserSession:
+    """requests-like wrapper so Buff lookups reuse the browser's logged-in cookies."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+
+    def get(self, url, params=None, timeout=20):
+        return _Resp(self.ctx.request.get(
+            url, params=params, timeout=timeout * 1000,
+            headers={"Referer": "https://buff.163.com/market/csgo", "Accept": "application/json"},
+        ))
+
+
+def _buff_ok(ctx):
+    try:
+        r = ctx.request.get("https://buff.163.com/api/market/goods",
+                            params={"game": "csgo", "page_num": 1, "page_size": 1}, timeout=15000)
+        return r.json().get("code") == "OK"
+    except Exception:
+        return False
+
+
+def ensure_buff_session(ctx, cfg, log, stop):
+    if cfg.get("buff_cookie"):
+        return None  # run_compare builds a normal requests session using the cookie
+    if _buff_ok(ctx):
+        return BrowserSession(ctx)
+    page = ctx.new_page()
+    try:
+        page.goto(cfg["buff_url"], wait_until="domcontentloaded", timeout=60000)
+    except Exception:
+        pass
+    log("Log in to Buff163 in the window (one time). I'll wait...")
+    t0 = time.time()
+    while time.time() - t0 < float(cfg["login_wait_seconds"]) and not stop():
+        page.wait_for_timeout(3000)
+        if _buff_ok(ctx):
+            log("Buff163 login detected.")
+            break
+    return BrowserSession(ctx)
+
+
 def fetch_csgoroll(cfg, log):
     if not os.path.exists(CURL_PATH):
         raise RuntimeError(
@@ -228,7 +398,7 @@ def buff_lookup(name, session, cache, ttl_s):
     j = r.json()
     if j.get("code") != "OK":
         raise RuntimeError(
-            f"Buff error: {j.get('error') or j.get('code')} - check your buff_cookie in config.json"
+            f"Buff error: {j.get('error') or j.get('code')} - log in to Buff163 in the browser window (or set buff_cookie in config.json)"
         )
     for it in j["data"]["items"]:
         if it.get("market_hash_name") == name:
@@ -259,18 +429,19 @@ def compute_row(listing, buff, cfg):
     }
 
 
-def run_compare(listings, cfg, log, stop=lambda: False, lookup=buff_lookup, sleep=True):
+def run_compare(listings, cfg, log, stop=lambda: False, lookup=buff_lookup, sleep=True, session=None):
     lo, hi = float(cfg["min_coins"]), float(cfg["max_coins"])
     filtered = [x for x in listings if lo <= x["coins"] <= hi]
     log(f"Coin filter {lo:g}-{hi:g}: {len(filtered)} of {len(listings)} listings kept")
 
     names = sorted({x["name"] for x in filtered})
     cache = load_cache()
-    session = requests.Session()
-    session.headers.update({"User-Agent": UA, "Accept": "application/json",
-                            "Referer": "https://buff.163.com/market/csgo"})
-    if cfg.get("buff_cookie"):
-        session.headers["Cookie"] = cfg["buff_cookie"]
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": UA, "Accept": "application/json",
+                                "Referer": "https://buff.163.com/market/csgo"})
+        if cfg.get("buff_cookie"):
+            session.headers["Cookie"] = cfg["buff_cookie"]
     ttl = float(cfg["cache_minutes"]) * 60
 
     prices = {}
@@ -307,6 +478,31 @@ def run_compare(listings, cfg, log, stop=lambda: False, lookup=buff_lookup, slee
 
 
 # ------------------------------------------------------------------ GUI -----
+def do_fetch_and_compare(cfg, log, stop):
+    if not cfg.get("use_browser", True):
+        listings = fetch_csgoroll(cfg, log)
+        log(f"Pulled {len(listings)} listings from CSGORoll.")
+        return run_compare(listings, cfg, log, stop=stop)
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError("playwright is not installed (pip install playwright)")
+    with sync_playwright() as pw:
+        ctx = launch_context(pw, cfg, log)
+        try:
+            listings = fetch_csgoroll_browser(ctx, cfg, log, stop)
+            log(f"Captured {len(listings)} listings from CSGORoll.")
+            if stop() or not listings:
+                return []
+            session = ensure_buff_session(ctx, cfg, log, stop)
+            return run_compare(listings, cfg, log, stop=stop, session=session)
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
 COLUMNS = [
     ("name", "Item", 280), ("coins", "Coins", 70), ("cost_usd", "Cost $", 70),
     ("buff_cny", "Buff ¥", 70), ("buff_usd", "Buff $", 70),
@@ -374,9 +570,7 @@ def main_gui():
 
     def worker():
         try:
-            listings = fetch_csgoroll(cfg, log)
-            log(f"Pulled {len(listings)} listings from CSGORoll.")
-            rows = run_compare(listings, cfg, log, stop=lambda: state["stop"])
+            rows = do_fetch_and_compare(cfg, log, lambda: state["stop"])
             state["rows"] = rows
             root.after(0, lambda: show(rows))
         except Exception as e:
@@ -426,7 +620,7 @@ def main_cli(argv):
     for flag, key in (("--min", "min_coins"), ("--max", "max_coins"), ("--roi", "min_roi_pct")):
         if flag in args:
             cfg[key] = float(args[flag])
-    rows = run_compare(fetch_csgoroll(cfg, print), cfg, print)
+    rows = do_fetch_and_compare(cfg, print, lambda: False)
     for r in rows[:30]:
         print(f"{r['roi_pct']:6.1f}%  ${r['profit_usd']:7.2f}  {r['coins']:8.2f}c  {r['name']}")
 

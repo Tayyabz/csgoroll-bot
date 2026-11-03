@@ -1,6 +1,7 @@
 config.json
 csgoroll_request.txt
 buff_cache.json
+browser_profile/
 build/
 dist/
 __pycache__/
