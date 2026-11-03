@@ -50,6 +50,7 @@ DEFAULT_CONFIG = {
     "market_url": "https://www.csgoroll.com/trade/market/",
     "buff_url": "https://buff.163.com/market/csgo",
     "login_wait_seconds": 180,     # how long to wait for you to log in inside the window
+    "max_scrolls": 400,            # max scroll rounds per fetch (stops earlier when no more load)
     "scroll_wait": 1.5,            # seconds to wait after each scroll for new listings
     "cache_minutes": 30,           # reuse Buff prices this long to avoid hammering Buff
     "min_coins": 0.0,
@@ -245,7 +246,7 @@ def fetch_csgoroll_browser(ctx, cfg, log, stop):
 
     lo = float(cfg["min_coins"])
     idle = 0
-    for rnd in range(int(cfg["max_pages"])):
+    for rnd in range(int(cfg.get("max_scrolls", 400))):
         if stop():
             break
         before = len(items)
@@ -460,20 +461,27 @@ def run_compare(listings, cfg, log, stop=lambda: False, lookup=buff_lookup, slee
             time.sleep(random.uniform(1.2, 2.5))
     save_cache(cache)
 
-    rows = []
+    rows, no_match = [], []
     for x in filtered:
-        b = prices.get(x["name"])
-        if not b:
+        if x["name"] not in prices:  # lookup never ran (stopped or errored)
             continue
-        if b["sell_num"] < int(cfg["min_buff_listings"]):
+        b = prices[x["name"]]
+        price = 0 if not b else (b["sell_min"] if cfg["buff_price_mode"] == "sell_min" else b["buy_max"])
+        if not b or price <= 0:
+            no_match.append(x)
             continue
-        if (b["sell_min"] if cfg["buff_price_mode"] == "sell_min" else b["buy_max"]) <= 0:
-            continue
-        row = compute_row(x, b, cfg)
-        if row["roi_pct"] >= float(cfg["min_roi_pct"]):
-            rows.append(row)
-    rows.sort(key=lambda r: r["roi_pct"], reverse=True)
-    log(f"Done: {len(rows)} listings pass your filters.")
+        rows.append(compute_row(x, b, cfg))
+    rows.sort(key=lambda r: r["profit_usd"], reverse=True)
+    not_looked = len(filtered) - len(rows) - len(no_match)
+    log(f"Summary: {len(filtered)} in coin range, {len(rows)} priced on Buff, "
+        f"{len(no_match)} not found on Buff"
+        + (f", {not_looked} not looked up (stopped early)" if not_looked > 0 else ""))
+    if no_match:
+        log("Not found on Buff (name mismatch?): " + "; ".join(sorted({x["name"] for x in no_match})[:8]))
+    for x in sorted(no_match, key=lambda x: x["coins"]):
+        rows.append({"name": x["name"], "coins": x["coins"], "cost_usd": x["coins"] * cfg["usd_per_coin"],
+                     "buff_cny": None, "buff_usd": None, "payout_usd": None,
+                     "profit_usd": None, "roi_pct": None, "buff_listings": None})
     return rows
 
 
@@ -532,9 +540,8 @@ def main_gui():
 
     field("Min coins", "min_coins", 0)
     field("Max coins", "max_coins", 1)
-    field("Min ROI %", "min_roi_pct", 2)
-    field("$/coin", "usd_per_coin", 3, 6)
-    field("CNY/$", "cny_per_usd", 4, 6)
+    field("$/coin", "usd_per_coin", 2, 6)
+    field("CNY/$", "cny_per_usd", 3, 6)
 
     ttk.Label(top, text="Buff price").grid(row=1, column=0, sticky="e", padx=(8, 2), pady=6)
     mode = tk.StringVar(value="Lowest listing" if cfg["buff_price_mode"] == "sell_min" else "Highest buy order")
@@ -543,7 +550,7 @@ def main_gui():
 
     tree = ttk.Treeview(root, columns=[c[0] for c in COLUMNS], show="headings")
     for key, title, w in COLUMNS:
-        tree.heading(key, text=title)
+        tree.heading(key, text=title, command=lambda k=key: sort_by(k))
         tree.column(key, width=w, anchor="w" if key == "name" else "e")
     tree.pack(fill="both", expand=True, padx=8)
 
@@ -562,11 +569,22 @@ def main_gui():
 
     def show(rows):
         tree.delete(*tree.get_children())
+        def f(v, d=2):
+            return "-" if v is None else f"{v:.{d}f}"
         for r in rows:
             tree.insert("", "end", values=(
-                r["name"], f"{r['coins']:.2f}", f"{r['cost_usd']:.2f}", f"{r['buff_cny']:.2f}",
-                f"{r['buff_usd']:.2f}", f"{r['payout_usd']:.2f}", f"{r['profit_usd']:.2f}",
-                f"{r['roi_pct']:.1f}", r["buff_listings"]))
+                r["name"], f(r["coins"]), f(r["cost_usd"]), f(r["buff_cny"]), f(r["buff_usd"]),
+                f(r["payout_usd"]), f(r["profit_usd"]), f(r["roi_pct"], 1),
+                "-" if r["buff_listings"] is None else r["buff_listings"]))
+
+    def sort_by(key):
+        rev = not (state.get("sort_key") == key and state.get("sort_rev"))
+        state["sort_key"], state["sort_rev"] = key, rev
+        have = [r for r in state["rows"] if r.get(key) is not None]
+        none = [r for r in state["rows"] if r.get(key) is None]
+        have.sort(key=lambda r: str(r[key]).lower() if key == "name" else r[key], reverse=rev)
+        state["rows"] = have + none
+        show(state["rows"])
 
     def worker():
         try:
@@ -622,7 +640,8 @@ def main_cli(argv):
             cfg[key] = float(args[flag])
     rows = do_fetch_and_compare(cfg, print, lambda: False)
     for r in rows[:30]:
-        print(f"{r['roi_pct']:6.1f}%  ${r['profit_usd']:7.2f}  {r['coins']:8.2f}c  {r['name']}")
+        print(f"{r['roi_pct']:6.1f}%  ${r['profit_usd']:7.2f}  {r['coins']:8.2f}c  {r['name']}"
+              if r["profit_usd"] is not None else f"   n/a   (no Buff match)  {r['coins']:8.2f}c  {r['name']}")
 
 
 if __name__ == "__main__":

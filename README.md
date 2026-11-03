@@ -11,12 +11,12 @@ It builds automatically on GitHub: **Actions** tab → latest "Build Windows exe
 ## Use it
 1. You need **Google Chrome** (or Microsoft Edge) installed.
 2. Double-click `CSGORollArb.exe`. A window opens (no black console).
-3. Set **Min coins / Max coins** (the coin filter), **Min ROI %**, and the two rates (see below).
+3. Set **Min coins / Max coins** (the coin filter) and the two rates (see below).
 4. Press **Fetch & Compare**. A browser window opens on the CSGORoll market.
    - **First time only:** log in to CSGORoll in that window. If Buff163 asks, log in there too.
      The logins are saved in the `browser_profile` folder next to the exe, so later runs need nothing.
    - Leave the window alone while it scrolls. It closes by itself when done.
-5. Results appear sorted by ROI. **Export CSV** saves them.
+5. Results are sorted by profit. Click any column header to re-sort. Items not found on Buff are listed at the bottom with "-". **Export CSV** saves them.
 
 Tip: if the site's list is sorted high to low (default), the app stops scrolling once it reaches
 listings below your Min coins, so a narrow range with a high minimum is fast.
@@ -37,8 +37,8 @@ The defaults are placeholders. Check them in the app (top bar) or `config.json`:
 - Old method: set `"use_browser": false` and provide `csgoroll_request.txt` (cURL, bash format).
 
 ## Notes
-- Items with fewer than `min_buff_listings` (default 3) Buff listings are skipped (thin markets give fake low prices).
-- Names must match Buff's `market_hash_name` exactly (e.g. `AK-47 | Redline (Field-Tested)`); others are skipped.
+- Nothing is filtered out except by your coin range. Check the **Buff #** column (number of Buff listings): a low number means the Buff price may be unreliable.
+- Names must match Buff's `market_hash_name` exactly (e.g. `AK-47 | Redline (Field-Tested)`); others are shown at the bottom without prices.
 - Float, stickers and pattern premiums are not priced.
 - skins.com's real payout can differ from Buff minus 5%. Check live numbers before acting.
 - Automated browsing may go against CSGORoll's or Buff's terms of service. Use it lightly, at your own risk.
