@@ -1,0 +1,28 @@
+name: Build Roll Tracker exe
+
+on:
+  push:
+    branches: [roll-tracker]
+    paths: ["roll-tracker/**", ".github/workflows/build-roll-tracker.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: roll-tracker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pyinstaller
+      - name: Build exe (windowed GUI app)
+        run: python -m PyInstaller --onefile --windowed --name RollTracker roll_tracker.py
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: RollTracker-windows
+          path: roll-tracker/dist/RollTracker.exe

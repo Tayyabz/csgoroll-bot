@@ -1,0 +1,5 @@
+rolls_log.csv
+build/
+dist/
+__pycache__/
+*.spec
